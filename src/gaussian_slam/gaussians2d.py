@@ -48,9 +48,22 @@ class Gaussians2D(nn.Module):
         return (weight.T @ color).reshape(h, w, 3)  # (H*W, N) @ (N, 3)
 
 
-def fit(model: Gaussians2D, target: torch.Tensor, steps: int = 2000, lr: float = 0.01):
-    """Gradient descent on the mean squared error. Returns [(step, PSNR), ...]."""
+def fit(
+    model: Gaussians2D,
+    target: torch.Tensor,
+    steps: int = 2000,
+    lr: float = 0.01,
+    lr_min_ratio: float = 0.01,
+):
+    """Gradient descent on the mean squared error. Returns [(step, PSNR), ...].
+
+    The learning rate follows a cosine curve from ``lr`` at the first step down to
+    ``lr * lr_min_ratio`` at the last: big moves early, fine-tuning at the end.
+    """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=steps, eta_min=lr * lr_min_ratio
+    )
     history = []
     for step in range(1, steps + 1):
         pred = model()
@@ -58,7 +71,9 @@ def fit(model: Gaussians2D, target: torch.Tensor, steps: int = 2000, lr: float =
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
         if step == 1 or step % 50 == 0:
             history.append((step, psnr(pred.detach(), target)))
-            print(f"step {step:5d}  PSNR {history[-1][1]:.2f} dB")
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"step {step:5d}  PSNR {history[-1][1]:.2f} dB  lr {current_lr:.2e}")
     return history

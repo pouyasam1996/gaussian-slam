@@ -17,7 +17,7 @@ from gaussian_slam.gaussians2d import Gaussians2D, fit
 parser = argparse.ArgumentParser()
 parser.add_argument("image")
 parser.add_argument("--size", type=int, default=256, help="longer side in pixels")
-parser.add_argument("--n", type=int, default=1000, help="number of blobs")
+parser.add_argument("--n", type=int, default=2000, help="number of blobs")
 parser.add_argument("--steps", type=int, default=2000, help="number of optimization steps")
 args = parser.parse_args()
 
