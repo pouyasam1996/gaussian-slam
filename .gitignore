@@ -1,0 +1,48 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+
+# --- Environments ---
+.venv/
+.venv.nosync/
+.env
+.env.*
+
+# --- Tool caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# --- Data (tracked by DVC from Stage 1, never by git) ---
+data/
+
+# --- Run outputs ---
+outputs/
+multirun/
+wandb/
+runs/
+
+# --- Model files ---
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.plan
+
+# --- OS and editors ---
+.DS_Store
+.idea/
+.vscode/
+
+# --- Gaussian splat / reconstruction outputs ---
+*.ply
+*.splat

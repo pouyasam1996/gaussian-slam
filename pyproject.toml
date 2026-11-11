@@ -1,0 +1,42 @@
+[project]
+name = "gaussian-slam"
+version = "0.1.0"
+description = "SLAM with 3D Gaussian Splatting: incremental 3D Gaussian scene reconstruction and camera tracking for training."
+readme = "README.md"
+authors = [
+    { name = " ", email = " " }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "torch>=2.14.1",
+    "torchvision>=0.29.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.4,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "W", "SIM", "NPY", "UP", "RUF"]
+# E501: line length is enforced by the formatter
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "gpu: needs a CUDA GPU",
+    "slow: takes more than a few seconds",
+]
