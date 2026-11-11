@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "SLAM with 3D Gaussian Splatting: incremental 3D Gaussian scene reconstruction and camera tracking for training."
 readme = "README.md"
 authors = [
-    { name = " ", email = " " }
+    { name = "Pouya Samandi", email = "samandi.pouya@gmail.com" }
 ]
 requires-python = ">=3.10"
 dependencies = [
