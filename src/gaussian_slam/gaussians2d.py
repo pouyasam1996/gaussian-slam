@@ -65,15 +65,19 @@ def fit(
         optimizer, T_max=steps, eta_min=lr * lr_min_ratio
     )
     history = []
-    for step in range(1, steps + 1):
-        pred = model()
-        loss = torch.mean((pred - target) ** 2)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        if step == 1 or step % 50 == 0:
-            history.append((step, psnr(pred.detach(), target)))
-            current_lr = scheduler.get_last_lr()[0]
-            print(f"step {step:5d}  PSNR {history[-1][1]:.2f} dB  lr {current_lr:.2e}")
+    try:
+        for step in range(1, steps + 1):
+            pred = model()
+            loss = torch.mean((pred - target) ** 2)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            if step == 1 or step % 50 == 0:
+                history.append((step, psnr(pred.detach(), target)))
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"step {step:5d}  PSNR {history[-1][1]:.2f} dB  lr {current_lr:.2e}")
+    except KeyboardInterrupt:
+        # Ctrl+C stops training early; the caller still gets the model as it is now.
+        print(f"\ninterrupted at step {step}, stopping early")
     return history

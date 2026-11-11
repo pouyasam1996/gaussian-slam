@@ -38,9 +38,10 @@ with torch.no_grad():
     final = model().clamp(0, 1).cpu().numpy()
 Image.fromarray((final * 255).round().astype(np.uint8)).save(out / "final.png")
 
-steps, values = zip(*history, strict=True)
-plt.plot(steps, values)
-plt.xlabel("step")
-plt.ylabel("PSNR (dB)")
-plt.savefig(out / "psnr.png")
+if history:  # empty if stopped with Ctrl+C before the first log line
+    steps, values = zip(*history, strict=True)
+    plt.plot(steps, values)
+    plt.xlabel("step")
+    plt.ylabel("PSNR (dB)")
+    plt.savefig(out / "psnr.png")
 print(f"saved to {out}")
