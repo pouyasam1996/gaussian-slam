@@ -45,6 +45,56 @@ Press **Ctrl+C** to stop early. The current result is still saved, but because t
 | `src/gaussian_slam/device.py` | Picks the device: CUDA, then Apple MPS, then CPU (override with `GS_DEVICE=cpu`) |
 | `scripts/fit_2d.py` | Command-line script to fit a photo |
 
+## Step 2: 3D Gaussians from several cameras
+
+This step moves to 3D. A scene is a set of 3D Gaussian blobs, each with a position, rotation, size, colour and opacity. To render it from a camera, every blob is projected to a 2D ellipse on the image, the blobs are sorted near to far, and their colours are blended front to back. The renderer is differentiable, so the blobs can be fitted to images taken from several cameras.
+
+`scripts/synthetic_3d.py` tests the whole pipeline on a scene where the answer is known. It builds a true scene of blobs, renders it from 12 training cameras (two rings, one above and one below), scrambles every parameter and optimizes the scene back from the training images alone. 2 held-out cameras, at an angle no training camera has, show whether it learned the 3D shape or only memorized the training views.
+
+```bash
+uv run python scripts/synthetic_3d.py                  # a rainbow torus
+uv run python scripts/synthetic_3d.py --shape helix
+uv run python scripts/synthetic_3d.py --shape random   # blobs scattered in a cube
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--shape` | `torus` | True scene: `torus`, `helix` or `random` |
+| `--size` | `64` | Image side, in pixels |
+| `--n` | `300` | Number of blobs |
+| `--steps` | `3000` | Number of optimization steps |
+
+Before fitting, the script runs three quick checks: a point projected by hand, camera conversions (`look_at` and a Blender camera), and the renderer's gradients against small-step estimates. Any failure stops the script.
+
+Each step trains on one random camera. Training uses Adam with a cosine learning-rate decay, and blob positions get a 10x smaller learning rate than the other parameters. Mean PSNR is printed every 100 steps. At the end the script prints training and held-out PSNR, and the **shape error**: the mean distance from each visible blob to the nearest true blob (the scene is about 2 units wide). Results are written to `outputs/synthetic3d/`:
+
+- `scene_3d.png`: blob centres in 3D for the true scene, the scrambled start and the fitted result
+- `views.png`: target, start, fitted, error and depth images for 4 training and both held-out cameras
+- `training.png`: mean training PSNR over steps
+- `heldout.png`: the held-out cameras rendered at 3x resolution with a zoom lens, true vs fitted
+
+Press **Ctrl+C** to stop early, as in step 1.
+
+Images are small (64 px) because, as in step 1, every blob is evaluated at every pixel.
+
+### Background colour
+
+`render()`, `Gaussians3D.forward()` and `fit()` take an optional `background` colour of shape `(3,)`: what shows through where no blob covers the pixel. It defaults to **black**, which is what `synthetic_3d.py` uses. The Blender dataset in the next step has a **white** background, so code for it must pass the background explicitly, without changing the default:
+
+```python
+white = torch.ones(3, device=device)
+fit(model, cams, targets, background=white)
+image, depth, alpha = model(cam, white)
+```
+
+If the background does not match the targets, the blobs are pushed to paint the background themselves.
+
+| File | Purpose |
+| --- | --- |
+| `src/gaussian_slam/geometry.py` | Quaternion rotations, 3D covariances, the pinhole `Camera` (OpenCV convention), projection, `look_at`, and Blender/OpenGL to OpenCV camera conversion |
+| `src/gaussian_slam/gaussians3d.py` | The `render()` function (image, depth, alpha), the `Gaussians3D` model and the multi-view `fit()` loop |
+| `scripts/synthetic_3d.py` | Checks, then fits a scrambled synthetic scene and saves the figures |
+
 ## Development
 
 | File | Purpose |
