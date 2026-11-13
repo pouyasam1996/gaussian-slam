@@ -1,10 +1,12 @@
-"""Step 1.7: add blobs where detail is missing, delete blobs that do nothing.
+"""Step 3: add blobs where detail is missing, delete blobs that do nothing.
 
 Every step, track(): how hard is each blob pulled around on the screen? This is the size of
 the gradient of its 2D centre, averaged over the views it was drawn in.
 
 Every `every` steps, densify_and_prune():
-  pulled hard and small  -> clone: add a copy; the next steps pull the two apart
+  pulled hard and small  -> clone: add a copy; the next steps pull the two apart. Both get
+                            opacity 1 - sqrt(1 - o), so together they block as much light as
+                            the original did
   pulled hard and large  -> split: replace it by 2 blobs drawn from inside it, 1.6x smaller
   nearly transparent or huge -> prune: delete it
 
@@ -21,7 +23,7 @@ from torch import nn
 
 from gaussian_slam.geometry import quat_to_rotmat
 
-PARAMS = ("means", "quats", "log_scales", "color_raw", "opacity_raw")
+PARAMS = ("means", "quats", "log_scales", "color_raw", "sh_rest", "opacity_raw")
 
 
 class DensityControl:
@@ -96,6 +98,11 @@ class DensityControl:
         split = grow & ~clone
         seen = avg[self.count > 0].sort().values  # for the printout: blobs drawn at least once
 
+        # Clones: original and copy share the opacity so that the pair blocks as much light
+        # as the original: (1 - o')^2 = 1 - o.
+        o = opacity[clone].clamp(max=1 - 1e-6)
+        model.opacity_raw[clone] = torch.logit(1 - torch.sqrt(1 - o))
+
         params = {name: getattr(model, name) for name in PARAMS}
         halves = [split_half(params, split, self.split_shrink) for _ in range(2)]
         new_rows = {
@@ -134,6 +141,7 @@ def split_half(params, split, shrink):
         "quats": params["quats"][split],
         "log_scales": params["log_scales"][split] - math.log(shrink),
         "color_raw": params["color_raw"][split],
+        "sh_rest": params["sh_rest"][split],
         "opacity_raw": params["opacity_raw"][split],
     }
 

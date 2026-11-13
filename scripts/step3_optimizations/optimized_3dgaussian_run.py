@@ -1,11 +1,15 @@
-"""Step 4: fit blobs to the Blender Lego scene, then test on unseen views.
+"""Step 3: fit blobs to the Blender Lego scene, then test on unseen views.
 
-uv run python scripts/step4_lego/lego.py               # 100 px, 10k steps, exact, densify
-uv run python scripts/step4_lego/lego.py --steps 3000  # quick check, ~10 min
-uv run python scripts/step4_lego/lego.py --mode sampled  # approximate training steps
+uv run python scripts/step3_optimizations/optimized_3dgaussian_run.py               # 100 px, 10k steps
+uv run python scripts/step3_optimizations/optimized_3dgaussian_run.py --steps 3000  # quicker check
 
 Starts from random blobs in a cube (this dataset has no point cloud), white background,
-exact training steps, densification on.
+tiled renderer, densification on, and the original 3DGS recipe: a learning rate per
+parameter, view-dependent colour (SH degree 3), loss 0.8 L1 + 0.2 (1 - SSIM), opacity reset
+every 3000 steps.
+
+Before training, it checks that the tiled renderer draws the same image, with the same
+gradients, as step 2's dense render(); a mismatch stops the script with an AssertionError.
 
 Outputs in outputs/lego/:
   test_views.png  6 test views: target / fitted / error
@@ -30,22 +34,54 @@ from PIL import Image
 
 from gaussian_slam.device import get_device
 from gaussian_slam.geometry import look_at
-from gaussian_slam.metrics import psnr
-from gaussian_slam.step3_3d_advanced.densify import DensityControl
-from gaussian_slam.step3_3d_advanced.gaussians3d import Gaussians3D, fit
-from gaussian_slam.step4_lego.blender import load_split
+from gaussian_slam.metrics import psnr, ssim
+from gaussian_slam.step2_3d.gaussians3d import render
+from gaussian_slam.step3_optimizations.blender import load_split
+from gaussian_slam.step3_optimizations.densify import DensityControl
+from gaussian_slam.step3_optimizations.gaussians3d import Gaussians3D, fit
+from gaussian_slam.step3_optimizations.tiles import render_tiled
+
+
+def check_tiled():
+    """Step 2's dense render() and the tiled renderer draw the same picture, with the same
+    gradients.
+
+    The image is 40x40 (not a multiple of 16) and buckets are tiny, so a tile needs several
+    passes. Early stopping is off, so the only difference is the 1/255 cut-off.
+    """
+    torch.manual_seed(1)
+    n = 200
+    cam = look_at((0.0, -4.0, 1.0), (0.0, 0.0, 0.0), 40, 40)
+    blobs = [
+        torch.rand(n, 3) * 2 - 1,
+        torch.randn(n, 4),
+        torch.rand(n, 3) * 0.15 + 0.02,
+        torch.rand(n, 3),
+        torch.rand(n) * 0.9 + 0.05,
+    ]
+    blobs = [x.requires_grad_() for x in blobs]
+    dense = render(*blobs, cam)
+    tiled = render_tiled(*blobs, cam, buckets=(4, 8), light_eps=0.0)
+    image_diff = (dense[0] - tiled[0]).abs().max().item()
+    grads = [torch.autograd.grad(r[0].sum(), blobs[0])[0] for r in (dense, tiled)]
+    grad_diff = ((grads[0] - grads[1]).norm() / grads[0].norm()).item()
+    print(
+        f"check: dense vs tiled, max pixel diff {image_diff:.4f}, "
+        f"relative gradient diff {grad_diff:.4f}"
+    )
+    assert image_diff < 0.05 and grad_diff < 0.05, "tiled renderer does not match dense"
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data", default="data/lego", help="scene folder")
 parser.add_argument("--size", type=int, default=100, help="image side in pixels (data: 800)")
-parser.add_argument("--n", type=int, default=5000, help="blobs at the start")
+parser.add_argument("--n", type=int, default=10_000, help="blobs at the start")
 parser.add_argument("--steps", type=int, default=10_000)
-parser.add_argument("--mode", choices=["dense", "exact", "sampled", "auto"], default="exact")
-parser.add_argument("--exact-every", type=int, default=10, help="0 = never an exact step")
-parser.add_argument("--keep-ratio", type=float, nargs=2, default=(0.3, 0.9), help="start end")
 parser.add_argument("--no-densify", action="store_true")
 parser.add_argument("--max-blobs", type=int, default=30_000)
-parser.add_argument("--grad-threshold", type=float, default=2.5e-6, help="set near the printed p90")
+# 2.5e-6 suited the old MSE loss; L1 + SSIM pulls harder, so this is a first guess.
+parser.add_argument("--grad-threshold", type=float, default=7.5e-6, help="set near the printed p90")
+parser.add_argument("--reset-every", type=int, default=3000, help="opacity reset period, 0 = never")
 parser.add_argument(
     "--small-px", type=float, default=1.5, help="blobs smaller than this many pixels clone"
 )
@@ -54,8 +90,18 @@ parser.add_argument(
 )
 parser.add_argument("--extent", type=float, default=1.3, help="half-width of the start cube")
 parser.add_argument("--eval-views", type=int, default=5, help="views for the PSNR during training")
+parser.add_argument("--lr-means", type=float, default=0.001)
+parser.add_argument("--lr-colors", type=float, default=0.0025)
+parser.add_argument("--lr-opacity", type=float, default=0.025)
+parser.add_argument("--lr-scales", type=float, default=0.005)
+parser.add_argument("--lr-quats", type=float, default=0.001)
+parser.add_argument("--sh-degree", type=int, default=3, help="view-dependent colour, 0 = off")
+parser.add_argument(
+    "--ssim-weight", type=float, default=0.2, help="loss (1-w) L1 + w (1-SSIM); 0 = plain L1"
+)
 args = parser.parse_args()
 
+check_tiled()
 torch.manual_seed(0)
 random.seed(0)
 device = get_device()
@@ -78,7 +124,7 @@ print(
 )
 
 # 2. Model and densification.
-model = Gaussians3D(args.n, extent=args.extent).to(device)
+model = Gaussians3D(args.n, extent=args.extent, sh_degree=args.sh_degree).to(device)
 densify = None
 if not args.no_densify:
     # "Small" in pixels: one pixel at the object's distance covers distance / fx world units.
@@ -93,10 +139,11 @@ if not args.no_densify:
         extent=args.extent,
         grad_threshold=args.grad_threshold,
         stop=int(0.6 * args.steps),
+        reset_every=args.reset_every,
         max_blobs=args.max_blobs,
         small=args.small_px * pixel / args.extent,  # DensityControl wants a share of extent
     )
-options = {"budget_mb": args.budget_mb}  # passed to the tiled renderer (ignored by dense)
+options = {"budget_mb": args.budget_mb}  # passed to the tiled renderer
 
 # 3. Train.
 t0 = time.time()
@@ -105,34 +152,37 @@ history = fit(
     train_cams,
     train_images,
     steps=args.steps,
-    mode=args.mode,
-    exact_every=args.exact_every if args.mode in ("sampled", "auto") else 0,
     densify=densify,
     background=white,
-    keep_ratio_schedule=tuple(args.keep_ratio) if args.mode in ("sampled", "auto") else None,
     tile_options=options,
     eval_views=args.eval_views,
+    lr_means=args.lr_means,
+    lr_colors=args.lr_colors,
+    lr_opacity=args.lr_opacity,
+    lr_scales=args.lr_scales,
+    lr_quats=args.lr_quats,
+    ssim_weight=args.ssim_weight,
 )
 train_time = time.time() - t0
 torch.save(model.state_dict(), out / "model.pt")
 
-# 4. Final scores: every view, exact renderer.
-eval_mode = "dense" if args.mode == "dense" else "exact"
+# 4. Final scores: every view.
 
 
 @torch.no_grad()
 def render_all(cams):
-    return [model(c, white, mode=eval_mode, **options)[0].clamp(0, 1) for c in cams]
+    return [model(c, white, **options)[0].clamp(0, 1) for c in cams]
 
 
 test_renders = render_all(test_cams)
 test_scores = [psnr(r, t) for r, t in zip(test_renders, test_images, strict=True)]
+test_ssim = [ssim(r, t).item() for r, t in zip(test_renders, test_images, strict=True)]
 train_scores = [psnr(r, t) for r, t in zip(render_all(train_cams), train_images, strict=True)]
 print(
     f"\ntrained {args.steps} steps in {train_time / 60:.1f} min "
     f"({1000 * train_time / args.steps:.0f} ms/step), {model.means.shape[0]} blobs\n"
     f"PSNR  train {np.mean(train_scores):.2f} dB   test (200 unseen views) "
-    f"{np.mean(test_scores):.2f} dB"
+    f"{np.mean(test_scores):.2f} dB   test SSIM {np.mean(test_ssim):.3f}"
 )
 
 
@@ -182,7 +232,7 @@ with torch.no_grad():
         a = 2 * math.pi * k / 60
         eye = (3.5 * math.cos(a), 3.5 * math.sin(a), 2.0)
         cam = look_at(eye, (0.0, 0.0, 0.0), size, size, fov_deg=fov).to(device)
-        image = model(cam, white, mode=eval_mode, **options)[0].clamp(0, 1)
+        image = model(cam, white, **options)[0].clamp(0, 1)
         frames.append(Image.fromarray((to_numpy(image) * 255).astype(np.uint8)))
 frames[0].save(out / "orbit.gif", save_all=True, append_images=frames[1:], duration=60, loop=0)
 print(f"saved test_views.png, training.png, orbit.gif, model.pt to {out}")

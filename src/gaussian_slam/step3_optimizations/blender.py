@@ -1,4 +1,4 @@
-"""Step 4: load the NeRF-Synthetic (Blender) dataset at a chosen image size.
+"""Step 3: load the NeRF-Synthetic (Blender) dataset at a chosen image size.
 
 Each scene folder has transforms_{train,val,test}.json and the PNG images they list:
   camera_angle_x      horizontal field of view in radians (the same for every frame)

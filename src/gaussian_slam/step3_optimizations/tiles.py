@@ -1,18 +1,42 @@
-"""Tiled renderer: each blob is evaluated only in the 16x16-pixel tiles it can reach.
+"""Step 3: the tiled renderer. The same picture as step 2's render(), with far less memory.
 
-Same picture as gaussians3d.render() (up to the 1/255 cut-off), with far less memory.
+Why step 2's renderer is not enough
+-----------------------------------
+Step 2 evaluates every blob at every pixel. Each intermediate (offset, power, alpha, light
+left, weight, ...) is an (N blobs, H*W pixels) table, and autograd keeps about a dozen of
+them for the backward pass:
 
-  1. project   blobs -> 2D ellipses (shared with render())
-  2. pairs     radius where a blob fades below 1/255 -> one (blob, tile) pair for every tile
-               the blob reaches, sorted by tile, then near -> far
-  3. select    mode "sampled" only: in crowded tiles keep the important blobs plus a few
-               random ones
-  4. passes    each pass draws the next max(buckets) blobs of every tile, nearest first;
-               a tile stops early once almost no light is left in it
-  5. buckets   inside a pass, tiles are grouped by how many blobs they draw and padded only
-               up to their bucket size; each group is sized to fit the memory budget
-  6. blend     per group: the dense math of render() on (tiles, K blobs, 256 pixels),
-               recomputed during backward instead of stored
+    Lego, 100 x 100 px, 20 000 blobs:  20 000 * 10 000 * 4 bytes = 0.8 GB per table, ~10 GB in all
+    the same at 800 x 800 px:          64x more, ~600 GB
+
+Almost all of it is wasted: a blob is a few pixels wide, and beyond about 3.3 spreads from its
+centre its alpha is below 1/255, which is invisible on a screen. A typical Lego blob reaches 1
+to 4 of the 49 tiles of a 100 px image. The tiled renderer only computes what is visible.
+
+The optimizations, in the order the image is made
+-------------------------------------------------
+  1. project   blobs -> 2D ellipses, exactly as in step 2 (project_blobs below)
+  2. pairs     cut the image into 16 x 16 tiles. For each blob, the radius where it fades
+               below 1/255 gives the tiles it reaches: one (blob, tile) pair per tile.
+               Pairs are sorted by tile, then near -> far inside each tile.
+               -> work is (pairs x 256 pixels) instead of (all blobs x all pixels)
+  3. passes    a tile may be reached by thousands of blobs. Each pass draws the next 256
+               of them, nearest first, carrying the light left from the earlier passes.
+               A tile whose pixels have almost no light left (< light_eps) stops: nothing
+               behind can show through. -> the size of one table is capped at 256 blobs
+  4. buckets   inside a pass, tiles are grouped by how many blobs they draw, and padded
+               only up to their bucket (16, 32, 64, 128 or 256). A tile with 20 blobs is
+               padded to 32, not 256. -> little work wasted on padding
+  5. groups    each bucket is cut into groups of tiles that fit the memory budget
+               (budget_mb). -> peak memory is fixed, whatever the blob count
+  6. recompute each group's blending is wrapped in torch.utils.checkpoint: the forward pass
+               keeps only its inputs, and the backward pass recomputes the tables.
+               -> about 2x the compute of one group, but memory no longer grows with
+               the number of groups
+
+None of these change the picture except the 1/255 cut-off (and light_eps, which is at most
+0.001 of light): the blending math is step 2's, run on smaller tables. optimized_3dgaussian_run.py checks the
+image and the gradients against step 2's render() before training.
 """
 
 import math
@@ -20,7 +44,8 @@ import math
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from gaussian_slam.step3_3d_advanced.gaussians3d import MAX_ALPHA, project_blobs
+from gaussian_slam.geometry import Camera, covariance_3d, project, world_to_camera
+from gaussian_slam.step2_3d.gaussians3d import BLUR, MAX_ALPHA, NEAR
 
 TILE = 16
 PIX = TILE * TILE  # pixels per tile
@@ -34,28 +59,19 @@ def render_tiled(
     scales,
     colors,
     opacities,
-    cam,
+    cam: Camera,
     background=None,
-    mode: str = "exact",
     buckets=(16, 32, 64, 128, 256),
     budget_mb: float = 512,
     light_eps: float = 1e-3,
-    keep_ratio: float = 0.75,
-    max_pairs: int = 2_000_000,
 ):
-    """Same inputs and outputs as gaussians3d.render(): image, depth, alpha, info.
+    """Same inputs as step 2's render(). Returns image (H, W, 3), depth (H, W), alpha (H, W), info.
 
-    mode
-      "exact"    every blob that reaches a tile is drawn, in as many passes as needed
-      "sampled"  at most max(buckets) blobs per tile, one pass: keep_ratio of them chosen by
-                 importance, the rest at random (approximate)
-      "auto"     "exact" if there are at most max_pairs (blob, tile) pairs, else "sampled"
-    buckets     padding sizes; a tile drawing 20 blobs is padded to 32, not to the largest.
-                The largest is also the most blobs a tile draws in one pass.
-    budget_mb   memory for blending one group of tiles; bigger = fewer, larger groups
+    buckets     padding sizes; the largest is also the most blobs a tile draws in one pass
+    budget_mb   memory for blending one group of tiles: speed only, not the image
     light_eps   a tile skips later passes once every pixel has less light left than this
-    info        ids, mean2d (from project_blobs), visible (blobs drawn), mode used,
-                pairs, passes
+    info        what densification and the printout need: ids, mean2d (from project_blobs),
+                visible (blobs drawn), pairs, passes
     """
     h, w = cam.height, cam.width
     nx, ny = math.ceil(w / TILE), math.ceil(h / TILE)
@@ -66,14 +82,6 @@ def render_tiled(
     colors, opacities = colors[ids], opacities[ids]
 
     blob, tile = make_pairs(mean2d, z, cov, opacities, nx, ny)
-    used = mode
-    if mode == "auto":
-        used = "exact" if len(blob) <= max_pairs else "sampled"
-    if used == "sampled":
-        blob, tile = select_pairs(blob, tile, cov, opacities, nx * ny, max(buckets), keep_ratio)
-    elif used != "exact":
-        raise ValueError(f"unknown mode {mode!r}")
-
     color, depth, light, drawn, passes = blend_pairs(
         blob, tile, mean2d, inv, colors, opacities, z, nx, ny, buckets, budget_mb, light_eps
     )
@@ -83,15 +91,38 @@ def render_tiled(
         return x.reshape(ny * TILE, nx * TILE, *x.shape[4:])[:h, :w]
 
     image = to_image(color + light[..., None] * background)
-    info = {
-        "ids": ids,
-        "mean2d": mean2d,
-        "visible": drawn,
-        "mode": used,
-        "pairs": len(blob),
-        "passes": passes,
-    }
+    info = {"ids": ids, "mean2d": mean2d, "visible": drawn, "pairs": len(blob), "passes": passes}
     return image, to_image(depth), to_image(1 - light), info
+
+
+def project_blobs(means, quats, scales, cam: Camera):
+    """Step 1: blobs -> 2D ellipses on the screen, as in steps 1-2 of step 2's render().
+
+    Returns ids (n,) of the blobs in front of the camera (indices into all N blobs),
+    mean2d (n, 2) pixels, z (n,) depth, cov (a, b, c) = the 2D ellipse [[a, b], [b, c]],
+    inv (A, B, C) = its inverse.
+    """
+    p = world_to_camera(means, cam)  # (N, 3)
+    ids = torch.nonzero(p[:, 2] > NEAR).squeeze(1)
+    p = p[ids]
+    cov3d = covariance_3d(quats[ids], scales[ids])  # (n, 3, 3)
+    mean2d = project(p, cam)  # (n, 2) pixels
+    if mean2d.requires_grad:
+        mean2d.retain_grad()  # densification reads how hard each blob is pulled on screen
+    x, y, z = p.unbind(-1)
+
+    # 3D ellipsoid -> 2D ellipse: Sigma' = J W Sigma W^T J^T.
+    zero = torch.zeros_like(z)
+    J = torch.stack(
+        [cam.fx / z, zero, -cam.fx * x / z**2, zero, cam.fy / z, -cam.fy * y / z**2], dim=-1
+    ).reshape(-1, 2, 3)
+    JW = J @ cam.R
+    cov2d = JW @ cov3d @ JW.transpose(1, 2)
+    a = cov2d[:, 0, 0] + BLUR
+    b = cov2d[:, 0, 1]
+    c = cov2d[:, 1, 1] + BLUR
+    det = a * c - b * b
+    return ids, mean2d, z, (a, b, c), (c / det, -b / det, a / det)
 
 
 def blob_reach(opacities):
@@ -105,7 +136,7 @@ def blob_reach(opacities):
 
 @torch.no_grad()
 def make_pairs(mean2d, z, cov, opacities, nx, ny):
-    """One (blob, tile) pair for every tile a blob reaches, sorted by tile, then near -> far."""
+    """Step 2: one (blob, tile) pair for every tile a blob reaches, sorted by tile, then near -> far."""
     a, b, c = cov
     n = len(z)
     widest = 0.5 * (a + c) + torch.sqrt(0.25 * (a - c) ** 2 + b * b)  # largest variance
@@ -137,53 +168,10 @@ def make_pairs(mean2d, z, cov, opacities, nx, ny):
     return blob[order], tile[order]
 
 
-@torch.no_grad()
-def select_pairs(blob, tile, cov, opacities, n_tiles, slots, keep_ratio):
-    """Mode "sampled": in tiles with more than `slots` blobs, keep only `slots` of them.
-
-    keep_ratio of the slots go to the most important blobs, the rest to random others, so
-    every blob keeps a chance to be drawn and get a gradient. Pairs stay in (tile, depth) order.
-
-    Importance = opacity x share of the tile the blob covers x estimated light reaching it,
-    where the light is dimmed by the blobs in front of it in the same tile.
-    """
-    counts = torch.bincount(tile, minlength=n_tiles)
-    first = torch.cumsum(counts, 0) - counts  # index of each tile's first pair
-
-    a, b, c = cov
-    area = math.pi * blob_reach(opacities).clamp(min=0) * torch.sqrt(a * c - b * b)
-    block = (opacities * (area / PIX).clamp(max=1))[blob]  # how much of the tile each blocks
-    # Blocking by the blobs in front, inside the same tile: running sum minus the sum
-    # before the tile started. (A float32 running sum drifts slightly; fine for a ranking.)
-    run = torch.cumsum(block, 0)
-    start = first[tile]
-    in_front = run - block - (run[start] - block[start])
-    importance = block * torch.exp(-in_front)
-
-    crowded = counts[tile] > slots
-    n_top = round(slots * keep_ratio)
-    top = rank_in_tile(tile, importance, first) < n_top
-    second = top.float() + torch.rand_like(importance)  # top ones first, then random order
-    keep = ~crowded | (rank_in_tile(tile, second, first) < slots)
-    return blob[keep], tile[keep]
-
-
-def rank_in_tile(tile, score, first):
-    """Position of each pair inside its tile when the tile is sorted by score, largest first."""
-    n = len(score)
-    every = torch.arange(n, device=score.device)
-    score_rank = torch.empty_like(every)
-    score_rank[torch.argsort(score, descending=True)] = every
-    order = torch.argsort(tile * n + score_rank)
-    rank = torch.empty_like(every)
-    rank[order] = every - first[tile[order]]
-    return rank
-
-
 def blend_pairs(
     blob, tile, mean2d, inv, colors, opacities, z, nx, ny, buckets, budget_mb, light_eps
 ):
-    """Front-to-back blending of the sorted pairs, in passes, buckets and groups.
+    """Steps 3-6: front-to-back blending of the sorted pairs, in passes, buckets and groups.
 
     Returns color (T, PIX, 3), depth (T, PIX), light left (T, PIX), drawn (n,) bool, passes.
     """
@@ -193,7 +181,7 @@ def blend_pairs(
     chunk = max(buckets)  # most blobs a tile draws in one pass
     slots_per_group = max(1, int(budget_mb * 2**20 / (4 * TABLES * PIX)))  # (tile, blob) slots
 
-    counts = torch.bincount(tile, minlength=n_tiles)
+    counts = torch.bincount(tile, minlength=n_tiles)  # blobs reaching each tile
     pos = torch.arange(len(blob), device=dev) - (torch.cumsum(counts, 0) - counts)[tile]
     oy, ox = torch.meshgrid(torch.arange(TILE) + 0.5, torch.arange(TILE) + 0.5, indexing="ij")
     ox, oy = ox.reshape(-1).to(dev, dtype), oy.reshape(-1).to(dev, dtype)  # (PIX,) inside a tile
@@ -207,6 +195,7 @@ def blend_pairs(
     passes = 0
     max_count = int(counts.max()) if len(blob) else 0
     for p in range(math.ceil(max_count / chunk)):
+        # Step 3, passes: pass p draws blobs p*chunk .. (p+1)*chunk - 1 of each tile.
         with torch.no_grad():
             n_in = (counts - p * chunk).clamp(0, chunk)  # blobs each tile draws in this pass
             active = n_in > 0
@@ -217,10 +206,11 @@ def blend_pairs(
             in_pass = (pos // chunk == p) & active[tile]
             b, t, slot = blob[in_pass], tile[in_pass], pos[in_pass] % chunk
             drawn[b] = True
-            bucket = sizes[torch.searchsorted(sizes, n_in)]  # smallest size that fits
+            bucket = sizes[torch.searchsorted(sizes, n_in)]  # step 4: smallest size that fits
         passes += 1
 
         for K in sizes.tolist():
+            # Step 4, buckets: a (tiles, K) table of blob indices, -1 = padding.
             with torch.no_grad():
                 tiles_k = torch.nonzero(active & (bucket == K)).squeeze(1)
                 if len(tiles_k) == 0:
@@ -228,9 +218,10 @@ def blend_pairs(
                 row = torch.full((n_tiles,), -1, device=dev)
                 row[tiles_k] = torch.arange(len(tiles_k), device=dev)
                 mine = row[t] >= 0  # pairs whose tile is in this bucket
-                table = torch.full((len(tiles_k), K), -1, device=dev)  # -1 = padding
+                table = torch.full((len(tiles_k), K), -1, device=dev)
                 table[row[t[mine]], slot[mine]] = b[mine]
 
+            # Step 5, groups: as many tiles at once as the memory budget allows.
             group = max(1, slots_per_group // K)
             for g0 in range(0, len(tiles_k), group):
                 tg, idx = tiles_k[g0 : g0 + group], table[g0 : g0 + group]
@@ -242,6 +233,7 @@ def blend_pairs(
                     px, py, mean2d[idx], A[idx], B[idx], C[idx],
                     opacities[idx] * real, colors[idx], z[idx], light[tg],
                 )  # fmt: skip
+                # Step 6, recompute: keep only the inputs; rebuild the tables in backward.
                 if torch.is_grad_enabled():
                     c_g, d_g, left = checkpoint(blend_group, *args, use_reentrant=False)
                 else:
@@ -253,7 +245,7 @@ def blend_pairs(
 
 
 def blend_group(px, py, mean2d, A, B, C, opacity, color, z, light_in):
-    """render()'s steps 4-5 for g tiles with K blob slots each (padding has opacity 0).
+    """Step 2's render() steps 4-5 for g tiles with K blob slots each (padding has opacity 0).
 
     px, py (g, PIX); mean2d (g, K, 2); A, B, C, opacity, z (g, K); color (g, K, 3);
     light_in (g, PIX) = light left after earlier passes.
