@@ -1,8 +1,8 @@
 """Step 1.5: render a 3D blob scene, scramble it, and optimize it back.
 
-uv run python scripts/synthetic_3d.py                  # a rainbow torus
-uv run python scripts/synthetic_3d.py --shape helix
-uv run python scripts/synthetic_3d.py --shape random   # blobs scattered in a cube
+uv run python scripts/step2_3d/synthetic_3d.py                  # a rainbow torus
+uv run python scripts/step2_3d/synthetic_3d.py --shape helix
+uv run python scripts/step2_3d/synthetic_3d.py --shape random   # blobs scattered in a cube
 
 Outputs in outputs/synthetic3d/:
   scene_3d.png  blob centres in 3D: true shape, scrambled start, fitted result
@@ -28,9 +28,9 @@ import torch
 from matplotlib.colors import hsv_to_rgb
 
 from gaussian_slam.device import get_device
-from gaussian_slam.gaussians3d import Gaussians3D, fit, render
 from gaussian_slam.geometry import Camera, look_at, opengl_to_opencv, project
 from gaussian_slam.metrics import psnr
+from gaussian_slam.step2_3d.gaussians3d import Gaussians3D, fit, render
 
 
 def check_projection():
