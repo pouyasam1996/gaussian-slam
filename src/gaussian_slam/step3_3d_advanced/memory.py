@@ -50,7 +50,12 @@ def read_peak_mb(device):
 
 
 def is_out_of_memory(error):
-    return isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
+    """CUDA / MPS allocator: "... out of memory ...". Metal itself, on a Mac:
+    "... Insufficient Memory (...kIOGPUCommandBufferCallbackErrorOutOfMemory)"."""
+    if not isinstance(error, RuntimeError):
+        return False
+    message = str(error).lower()
+    return "out of memory" in message or "outofmemory" in message
 
 
 class MemoryBudget:

@@ -146,6 +146,7 @@ def fit(
     background: torch.Tensor | None = None,
     keep_ratio_schedule: tuple[float, float] | None = None,
     memory=None,
+    eval_views: int | None = None,
 ):
     """Fit the blobs to images from several cameras. Returns [(step, mean PSNR), ...].
 
@@ -162,9 +163,13 @@ def fit(
     random exploration early, when the blobs (and so their importance) are still poor.
     memory: a memory.MemoryBudget. Sets budget_mb every step, adjusts it from measured peaks,
     and on "out of memory" halves it and retries the step (up to 3 times).
+    eval_views: the PSNR printed every 100 steps uses this many evenly spaced cameras
+    (None = all of them; with 100 cameras, evaluating all would double the run time).
     """
     tile_options = tile_options or {}
     eval_mode = "dense" if mode == "dense" else "exact"
+    n_eval = len(cams) if eval_views is None else min(eval_views, len(cams))
+    eval_ids = [round(k * (len(cams) - 1) / max(1, n_eval - 1)) for k in range(n_eval)]
     optimizer = torch.optim.Adam(
         [
             {"params": [model.means], "lr": lr * 0.1},
@@ -218,12 +223,15 @@ def fit(
                     eval_options["budget_mb"] = memory.budget_mb
                 with torch.no_grad():
                     scores = [
-                        psnr(model(c, background, mode=eval_mode, **eval_options)[0], t)
-                        for c, t in zip(cams, targets, strict=True)
+                        psnr(
+                            model(cams[k], background, mode=eval_mode, **eval_options)[0],
+                            targets[k],
+                        )
+                        for k in eval_ids
                     ]
                 history.append((step, sum(scores) / len(scores)))
                 extra = ""
-                if "keep_ratio" in options and step_mode != "exact":
+                if "keep_ratio" in options:  # the schedule's value now, even on an exact step
                     extra += f"  keep_ratio {options['keep_ratio']:.2f}"
                 if memory is not None:
                     peak = f"{memory.peak_mb:.0f}" if memory.peak_mb is not None else "-"
