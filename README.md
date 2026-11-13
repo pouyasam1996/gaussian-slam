@@ -23,7 +23,7 @@ src/gaussian_slam/
   device.py, geometry.py, metrics.py    shared by all steps
   step1_2d/            gaussians2d.py
   step2_3d/            gaussians3d.py  (dense renderer)
-  step3_3d_advanced/   gaussians3d.py  (dense or tiled renderer), tiles.py, densify.py, memory.py
+  step3_3d_advanced/   gaussians3d.py  (dense or tiled renderer), tiles.py, densify.py
   step4_lego/          blender.py      (dataset loader; reuses step 3's model and renderer)
 scripts/
   step1_2d/fit_2d.py
@@ -142,22 +142,20 @@ The gradient threshold depends on the image size, because the loss is averaged o
 | `src/gaussian_slam/step3_3d_advanced/gaussians3d.py` | `project_blobs()`, dense `render()`, `Gaussians3D` with a `mode` switch, and `fit()` with optional densification |
 | `src/gaussian_slam/step3_3d_advanced/tiles.py` | `render_tiled()`: the tiled renderer |
 | `src/gaussian_slam/step3_3d_advanced/densify.py` | `DensityControl`: clone, split, prune and opacity reset |
-| `src/gaussian_slam/step3_3d_advanced/memory.py` | `MemoryBudget`: picks the tile-group memory budget from the GPU, adjusts it from measured peaks, halves it and retries a step on out of memory |
 | `scripts/step3_3d_advanced/synthetic_3d.py` | Step 2's experiment with a renderer choice and densification |
-
-`fit()` also takes `memory` (a `MemoryBudget`), `keep_ratio_schedule` (for `sampled` steps, the share of slots given to important blobs grows from start to end, e.g. `(0.3, 0.9)`) and `eval_views` (the PSNR printed every 100 steps uses only this many cameras). Step 4 uses all three; the synthetic script does not.
 
 ## Step 4: the Lego scene
 
-The first real multi-view data: the Lego bulldozer from the NeRF-Synthetic (Blender) dataset, 100 training and 200 test views at 800x800. Step 4 adds only a loader and a script; the model, renderers, densification and memory budget are step 3's.
+The first real multi-view data: the Lego bulldozer from the NeRF-Synthetic (Blender) dataset, 100 training and 200 test views at 800x800. Step 4 adds only a loader and a script; the model, renderers and densification are step 3's.
 
 `blender.py` reads `transforms_<split>.json`, converts each Blender/OpenGL camera to OpenCV, places the RGBA images on a **white** background and shrinks them by averaging pixel blocks. Training passes that white background to `fit()` and every render.
 
 Put the dataset in `data/lego/` (ignored by git), then:
 
 ```bash
-uv run python scripts/step4_lego/lego.py --grad-threshold 3e-6                    # 100 px, 3000 steps, ~5 min
-uv run python scripts/step4_lego/lego.py --size 200 --steps 10000 --max-blobs 50000 --grad-threshold 3e-6   # ~1 h
+uv run python scripts/step4_lego/lego.py                  # 100 px, 10k steps, exact, densify
+uv run python scripts/step4_lego/lego.py --steps 3000     # quicker check
+uv run python scripts/step4_lego/lego.py --mode sampled   # approximate, faster training steps
 ```
 
 | Option | Default | Meaning |
@@ -165,21 +163,22 @@ uv run python scripts/step4_lego/lego.py --size 200 --steps 10000 --max-blobs 50
 | `--data` | `data/lego` | Scene folder |
 | `--size` | `100` | Image side in pixels (the data is 800) |
 | `--n` | `5000` | Blobs at the start, random in a cube (the dataset has no point cloud) |
-| `--steps` | `3000` | Training steps |
-| `--mode` | `sampled` | Renderer for training steps |
+| `--steps` | `10000` | Training steps |
+| `--mode` | `exact` | Renderer for training steps |
 | `--exact-every` | `10` | With `sampled` / `auto`, every this many steps is exact |
-| `--keep-ratio` | `0.3 0.9` | `keep_ratio` schedule, start and end |
+| `--keep-ratio` | `0.3 0.9` | `sampled` / `auto` steps: share of a crowded tile's slots given to the most important blobs, growing from start to end over training; the rest are random |
 | `--no-densify` | off | Keep the blob count fixed |
-| `--max-blobs` | `20000` | Blob cap for densification |
-| `--grad-threshold` | `2e-4` | Densification threshold. **Too high for Lego**: at 100 px the largest screen gradients are around `5e-6`, so pass about `3e-6` |
-| `--no-memory` | off | Fixed `budget_mb`, no adjusting |
+| `--max-blobs` | `30000` | Blob cap for densification |
+| `--grad-threshold` | `2.5e-6` | Densification threshold; set it near the `p90` printed at each densification (it depends on `--size`) |
+| `--small-px` | `1.5` | Blobs smaller than this many pixels (at the object's distance) are cloned, larger ones split |
+| `--budget-mb` | `512` | Memory for blending one group of tiles (speed only, not the image) |
 | `--extent` | `1.3` | Half-width of the start cube |
-| `--eval-views` | `5` | Views for the PSNR printed during training |
+| `--eval-views` | `5` | Training views used for the PSNR printed every 100 steps |
 
 The final score uses every training view and all 200 test views, rendered with the exact renderer. Results go to `outputs/lego/`:
 
 - `test_views.png`: 6 test views, target / fitted / error
-- `training.png`: PSNR during training, with the final test PSNR
+- `training.png`: PSNR on `--eval-views` training views during training, with the final test PSNR
 - `orbit.gif`: a full turn around the fitted model at 2x the training size
 - `model.pt`: the fitted blobs (`model.state_dict()`)
 

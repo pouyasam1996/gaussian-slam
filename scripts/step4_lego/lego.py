@@ -1,11 +1,11 @@
 """Step 4: fit blobs to the Blender Lego scene, then test on unseen views.
 
-uv run python scripts/step4_lego/lego.py                                     # fast test: 100 px, ~5-10 min
-uv run python scripts/step4_lego/lego.py --size 200 --steps 10000 --max-blobs 50000   # better, ~1 h
-uv run python scripts/step4_lego/lego.py --mode exact                        # exact training steps only
+uv run python scripts/step4_lego/lego.py               # 100 px, 10k steps, exact, densify
+uv run python scripts/step4_lego/lego.py --steps 3000  # quick check, ~10 min
+uv run python scripts/step4_lego/lego.py --mode sampled  # approximate training steps
 
 Starts from random blobs in a cube (this dataset has no point cloud), white background,
-"sampled" training steps with an exact step every 10, densification on.
+exact training steps, densification on.
 
 Outputs in outputs/lego/:
   test_views.png  6 test views: target / fitted / error
@@ -33,21 +33,25 @@ from gaussian_slam.geometry import look_at
 from gaussian_slam.metrics import psnr
 from gaussian_slam.step3_3d_advanced.densify import DensityControl
 from gaussian_slam.step3_3d_advanced.gaussians3d import Gaussians3D, fit
-from gaussian_slam.step3_3d_advanced.memory import MemoryBudget
 from gaussian_slam.step4_lego.blender import load_split
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data", default="data/lego", help="scene folder")
 parser.add_argument("--size", type=int, default=100, help="image side in pixels (data: 800)")
 parser.add_argument("--n", type=int, default=5000, help="blobs at the start")
-parser.add_argument("--steps", type=int, default=3000)
-parser.add_argument("--mode", choices=["dense", "exact", "sampled", "auto"], default="sampled")
+parser.add_argument("--steps", type=int, default=10_000)
+parser.add_argument("--mode", choices=["dense", "exact", "sampled", "auto"], default="exact")
 parser.add_argument("--exact-every", type=int, default=10, help="0 = never an exact step")
 parser.add_argument("--keep-ratio", type=float, nargs=2, default=(0.3, 0.9), help="start end")
 parser.add_argument("--no-densify", action="store_true")
-parser.add_argument("--max-blobs", type=int, default=20_000)
-parser.add_argument("--grad-threshold", type=float, default=2e-4)
-parser.add_argument("--no-memory", action="store_true", help="fixed budget_mb, no adjusting")
+parser.add_argument("--max-blobs", type=int, default=30_000)
+parser.add_argument("--grad-threshold", type=float, default=2.5e-6, help="set near the printed p90")
+parser.add_argument(
+    "--small-px", type=float, default=1.5, help="blobs smaller than this many pixels clone"
+)
+parser.add_argument(
+    "--budget-mb", type=float, default=512, help="memory for blending one group of tiles"
+)
 parser.add_argument("--extent", type=float, default=1.3, help="half-width of the start cube")
 parser.add_argument("--eval-views", type=int, default=5, help="views for the PSNR during training")
 args = parser.parse_args()
@@ -73,17 +77,26 @@ print(
     f"in {time.time() - t0:.1f} s, device {device}"
 )
 
-# 2. Model, densification, memory budget.
+# 2. Model and densification.
 model = Gaussians3D(args.n, extent=args.extent).to(device)
 densify = None
 if not args.no_densify:
+    # "Small" in pixels: one pixel at the object's distance covers distance / fx world units.
+    # Camera centre = -R^T t; the object sits at the origin.
+    distance = np.mean([(-(c.R.T @ c.t)).norm().item() for c in train_cams])
+    pixel = distance / train_cams[0].fx
+    print(
+        f"one pixel ~ {pixel:.4f} units at distance {distance:.2f}; "
+        f"clone below {args.small_px} px = {args.small_px * pixel:.4f} units"
+    )
     densify = DensityControl(
         extent=args.extent,
         grad_threshold=args.grad_threshold,
         stop=int(0.6 * args.steps),
         max_blobs=args.max_blobs,
+        small=args.small_px * pixel / args.extent,  # DensityControl wants a share of extent
     )
-memory = None if args.no_memory or device.type == "cpu" else MemoryBudget(device)
+options = {"budget_mb": args.budget_mb}  # passed to the tiled renderer (ignored by dense)
 
 # 3. Train.
 t0 = time.time()
@@ -97,7 +110,7 @@ history = fit(
     densify=densify,
     background=white,
     keep_ratio_schedule=tuple(args.keep_ratio) if args.mode in ("sampled", "auto") else None,
-    memory=memory,
+    tile_options=options,
     eval_views=args.eval_views,
 )
 train_time = time.time() - t0
@@ -105,7 +118,6 @@ torch.save(model.state_dict(), out / "model.pt")
 
 # 4. Final scores: every view, exact renderer.
 eval_mode = "dense" if args.mode == "dense" else "exact"
-options = {"budget_mb": memory.budget_mb} if memory is not None else {}
 
 
 @torch.no_grad()

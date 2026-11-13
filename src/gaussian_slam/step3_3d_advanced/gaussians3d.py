@@ -12,7 +12,6 @@ from torch import nn
 
 from gaussian_slam.geometry import Camera, covariance_3d, project, world_to_camera
 from gaussian_slam.metrics import psnr
-from gaussian_slam.step3_3d_advanced.memory import is_out_of_memory
 
 NEAR = 0.2  # blobs closer than this to the camera are dropped
 BLUR = 0.3  # added to the 2D ellipse diagonal so no blob is smaller than a pixel
@@ -145,7 +144,6 @@ def fit(
     densify=None,
     background: torch.Tensor | None = None,
     keep_ratio_schedule: tuple[float, float] | None = None,
-    memory=None,
     eval_views: int | None = None,
 ):
     """Fit the blobs to images from several cameras. Returns [(step, mean PSNR), ...].
@@ -161,8 +159,6 @@ def fit(
     keep_ratio_schedule (start, end): for "sampled" steps, the share of slots given to
     important blobs grows linearly from start to end over training, e.g. (0.3, 0.9): more
     random exploration early, when the blobs (and so their importance) are still poor.
-    memory: a memory.MemoryBudget. Sets budget_mb every step, adjusts it from measured peaks,
-    and on "out of memory" halves it and retries the step (up to 3 times).
     eval_views: the PSNR printed every 100 steps uses this many evenly spaced cameras
     (None = all of them; with 100 cameras, evaluating all would double the run time).
     """
@@ -192,39 +188,19 @@ def fit(
                 r0, r1 = keep_ratio_schedule
                 options["keep_ratio"] = r0 + (r1 - r0) * (step - 1) / max(1, steps - 1)
 
-            for _attempt in range(3):
-                if memory is not None:
-                    memory.before_step(step)
-                    options["budget_mb"] = memory.budget_mb
-                try:
-                    image, _, _, info = model(cams[i], background, mode=step_mode, **options)
-                    loss = torch.mean((image - targets[i]) ** 2)
-                    optimizer.zero_grad()
-                    loss.backward()
-                    break
-                except RuntimeError as error:
-                    optimizer.zero_grad(set_to_none=True)  # drop half-finished gradients
-                    if memory is None or not is_out_of_memory(error):
-                        raise
-                    if not memory.on_out_of_memory():
-                        raise
-            else:
-                raise RuntimeError(f"step {step}: out of memory 3 times in a row")
-            if memory is not None:
-                memory.after_step(step)
-
+            image, _, _, info = model(cams[i], background, mode=step_mode, **options)
+            loss = torch.mean((image - targets[i]) ** 2)
+            optimizer.zero_grad()
+            loss.backward()
             optimizer.step()
             scheduler.step()
             if densify is not None:
                 densify.update(step, model, optimizer, info)  # may add / remove blobs
             if step == 1 or step % 100 == 0:
-                eval_options = dict(tile_options)
-                if memory is not None:
-                    eval_options["budget_mb"] = memory.budget_mb
                 with torch.no_grad():
                     scores = [
                         psnr(
-                            model(cams[k], background, mode=eval_mode, **eval_options)[0],
+                            model(cams[k], background, mode=eval_mode, **tile_options)[0],
                             targets[k],
                         )
                         for k in eval_ids
@@ -233,9 +209,8 @@ def fit(
                 extra = ""
                 if "keep_ratio" in options:  # the schedule's value now, even on an exact step
                     extra += f"  keep_ratio {options['keep_ratio']:.2f}"
-                if memory is not None:
-                    peak = f"{memory.peak_mb:.0f}" if memory.peak_mb is not None else "-"
-                    extra += f"  budget {memory.budget_mb:.0f} MiB  peak {peak} MiB"
+                if "pairs" in info:  # tiled renderer: crowding of the last training step
+                    extra += f"  pairs {info['pairs']}  passes {info['passes']}"
                 print(
                     f"step {step:5d}  mean PSNR {history[-1][1]:.2f} dB  "
                     f"blobs {model.means.shape[0]}{extra}"
