@@ -1,6 +1,6 @@
 """Step 1.2: fit 2D Gaussians to a photo.
 
-uv run python scripts/fit_2d.py path/to/photo.jpg
+uv run python scripts/step1_2d/fit_2d.py path/to/photo.jpg
 """
 
 import argparse
@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 
 from gaussian_slam.device import get_device
-from gaussian_slam.gaussians2d import Gaussians2D, fit
+from gaussian_slam.step1_2d.gaussians2d import Gaussians2D, fit
 
 parser = argparse.ArgumentParser()
 parser.add_argument("image")

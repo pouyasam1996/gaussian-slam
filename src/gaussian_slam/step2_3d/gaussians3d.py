@@ -115,11 +115,15 @@ def fit(
     steps: int = 3000,
     lr: float = 0.01,
     lr_min_ratio: float = 0.01,
+    background: torch.Tensor | None = None,
 ):
     """Fit the blobs to images from several cameras. Returns [(step, mean PSNR), ...].
 
     Each step uses one random camera. Positions get a smaller learning rate than the
     rest, because a step of 0.01 world units is a big move for a blob.
+
+    background (3,) must match the colour behind the objects in the targets: black
+    (the default, None) for synthetic_3d.py, white for the Blender dataset.
     """
     optimizer = torch.optim.Adam(
         [
@@ -135,7 +139,7 @@ def fit(
     try:
         for step in range(1, steps + 1):
             i = random.randrange(len(cams))
-            image, _, _ = model(cams[i])
+            image, _, _ = model(cams[i], background)
             loss = torch.mean((image - targets[i]) ** 2)
             optimizer.zero_grad()
             loss.backward()
@@ -143,7 +147,9 @@ def fit(
             scheduler.step()
             if step == 1 or step % 100 == 0:
                 with torch.no_grad():
-                    scores = [psnr(model(c)[0], t) for c, t in zip(cams, targets, strict=True)]
+                    scores = [
+                        psnr(model(c, background)[0], t) for c, t in zip(cams, targets, strict=True)
+                    ]
                 history.append((step, sum(scores) / len(scores)))
                 print(f"step {step:5d}  mean PSNR {history[-1][1]:.2f} dB")
     except KeyboardInterrupt:
