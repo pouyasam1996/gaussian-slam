@@ -22,6 +22,15 @@ Outputs in outputs/replica_<scene>/:
   stage_d_curves.png        pose errors and PSNR against seconds (fusion included), rounds marked
   stage_d_surface_<r>.ply   fused surface points of each round (round 0 = true poses)
   stage_d_rounds.csv        one row per round
+  stage_d_views.png         3 training frames: target / start / each round (each drawn from
+                            its own corrected cameras)
+  stage_d_trajectory.png    camera positions from above: true path, and each camera's error
+                            drawn 20x longer, for the start and each round
+  stage_d_gaussians_<n>.ply blob centres with colour: start, round1, round2, ...
+  stage_d_round<r>.pt       each round's refined model and its corrected cameras
+
+Camera learning rates restart at --lr-rot / --lr-trans every round and decay to
+--lr-pose-final of that by the end of the round.
 """
 
 import argparse
@@ -49,6 +58,12 @@ from gaussian_slam.step4_fusion.refine import (
     trajectory_report,
 )
 from gaussian_slam.step4_fusion.replica import frames
+from gaussian_slam.step4_fusion.report import (
+    save_checkpoint,
+    save_gaussians,
+    save_trajectory,
+    save_views,
+)
 from gaussian_slam.step4_fusion.surface import extract_points, save_ply
 from gaussian_slam.step4_fusion.tsdf import TSDFVolume
 
@@ -67,6 +82,11 @@ parser.add_argument("--trans", type=float, default=0.02, help="pose noise, metre
 parser.add_argument("--warmup", type=int, default=300, help="Gaussian-only steps each round")
 parser.add_argument("--depth-weight", type=float, default=1.0)
 parser.add_argument("--anchor-weight", type=float, default=100.0)
+parser.add_argument("--lr-rot", type=float, default=0.005, help="camera rotation lr (radians)")
+parser.add_argument("--lr-trans", type=float, default=0.005, help="camera shift lr (metres)")
+parser.add_argument(
+    "--lr-pose-final", type=float, default=0.1, help="camera lrs decay to this share by the end"
+)
 parser.add_argument("--stop-deg", type=float, default=0.01, help="stop: mean rotation change")
 parser.add_argument("--stop-mm", type=float, default=0.5, help="stop: mean position change")
 parser.add_argument("--budget-mb", type=float, default=512)
@@ -126,6 +146,9 @@ print(
     f"rotation {start['rot_rmse_deg']:.3f} deg (RMSE)"
 )
 rows, timeline = [], []  # timeline: (seconds, rotation deg, position cm, PSNR, round)
+noisy_dev = cams
+models, used_cams, reports = {}, {"start": cams}, {"start": start}  # for the pictures
+frame_ids = [k * args.every for k in range(len(cams))]
 clock = 0.0  # seconds since the start, fusion included
 for r in range(1, args.rounds + 1):
     print(f"\n=== round {r} ===")
@@ -140,11 +163,15 @@ for r in range(1, args.rounds + 1):
     torch.manual_seed(r)
     random.seed(r)
     model = from_surface(points, colors, normals, args.voxel).to(device)
+    if r == 1:  # the start: Gaussians from the noisy poses, before any training
+        models["start"] = from_surface(points, colors, normals, args.voxel).to(device)
     corrections = PoseCorrection(len(cams)).to(device)
     history = refine(
         model, corrections, cams, images, depths, mode="joint", steps=args.steps,
         warmup=args.warmup, depth_weight=args.depth_weight, anchor_weight=args.anchor_weight,
-        radius=args.voxel, background=black, tile_options=tile_options, truth=truth_dev,
+        radius=args.voxel, lr_rot=args.lr_rot, lr_trans=args.lr_trans,
+        lr_pose_final=args.lr_pose_final, background=black, tile_options=tile_options,
+        truth=truth_dev,
     )  # fmt: skip
     timeline += [(clock + s, rot, pos, p, r) for _, s, p, rot, pos in history]
     clock += history[-1][1]
@@ -162,6 +189,11 @@ for r in range(1, args.rounds + 1):
     )
     cams = new
     rep = trajectory_report(cams, truth_dev)
+    name = f"round {r}"
+    models[name], used_cams[name], reports[name] = model, cams, rep
+    save_checkpoint(
+        out / f"stage_d_round{r}.pt", model, cams, truth_dev, noisy_dev, frame_ids, vars(args)
+    )
     rows.append(
         (r, fuse_time, len(points), surf, rep["ate_rmse_cm"], rep["ate_median_cm"],
          rep["rot_rmse_deg"], rep["rot_median_deg"], history[-1][2], held, moved_deg, moved_mm,
@@ -220,3 +252,12 @@ for ax, col, label in zip(
 plt.tight_layout()
 plt.savefig(out / "stage_d_curves.png", dpi=120)
 print(f"saved stage_d_curves.png, stage_d_rounds.csv, stage_d_surface_*.ply to {out}")
+
+# 4. Pictures for a visual check (same as stage C).
+save_views(
+    out / "stage_d_views.png", models, used_cams, reports, images, frame_ids, black, tile_options
+)
+save_trajectory(out / "stage_d_trajectory.png", used_cams, reports, truth_dev)
+for name, m in models.items():
+    save_gaussians(out / f"stage_d_gaussians_{name.replace(' ', '')}.ply", m)
+print(f"saved stage_d_views.png, stage_d_trajectory.png, stage_d_gaussians_*.ply to {out}")

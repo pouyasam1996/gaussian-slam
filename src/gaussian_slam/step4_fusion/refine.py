@@ -18,6 +18,10 @@ Three schedules, each with the same budget of rendered images (`steps`):
   joint        every step updates both the Gaussians and that step's camera, after
                `warmup` Gaussian-only steps. (Like InstantSplat.)
   none         Gaussians only; the cameras stay as given. The "do nothing" reference.
+
+Camera learning rates start large and shrink by a constant factor each step, to
+`lr_pose_final` of their start value at the last step: big steps early cover the error
+quickly, small steps late stop the cameras jittering around the answer.
 """
 
 import math
@@ -135,15 +139,20 @@ def refine(
     lr_opacity: float = 0.01,
     lr_scales: float = 0.002,
     lr_quats: float = 0.001,
-    lr_rot: float = 0.003,
-    lr_trans: float = 0.002,
+    lr_rot: float = 0.005,
+    lr_trans: float = 0.005,
+    lr_pose_final: float = 0.1,
     background=None,
     tile_options: dict | None = None,
     truth: list[Camera] | None = None,
     log_every: int = 200,
     eval_views: int = 5,
 ):
-    """Returns [(step, seconds, mean PSNR, rotation error deg, position error cm), ...]."""
+    """Returns [(step, seconds, mean PSNR, rotation error deg, position error cm), ...].
+
+    lr_rot (radians) and lr_trans (metres): camera learning rates at the start; they decay
+    exponentially to lr_pose_final times that at the last step.
+    """
     if mode not in ("alternating", "joint", "none"):
         raise ValueError(f"unknown mode {mode!r}")
     tile_options = tile_options or {}
@@ -198,6 +207,11 @@ def refine(
         if train_gauss:
             g_opt.step()
         if train_pose:
+            # Exponential decay by overall progress, so every camera follows the same schedule
+            # however often it is picked.
+            factor = lr_pose_final ** (step / max(1, steps - 1))
+            rot_group, trans_group = p_opts[i].param_groups
+            rot_group["lr"], trans_group["lr"] = lr_rot * factor, lr_trans * factor
             p_opts[i].step()  # only camera i: the others are untouched, momentum included
         step += 1
         if step % log_every == 0:

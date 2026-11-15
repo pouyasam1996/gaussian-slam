@@ -56,7 +56,13 @@ from gaussian_slam.step4_fusion.refine import (
     trajectory_report,
 )
 from gaussian_slam.step4_fusion.replica import frames
-from gaussian_slam.step4_fusion.surface import extract_points, save_ply
+from gaussian_slam.step4_fusion.report import (
+    save_checkpoint,
+    save_gaussians,
+    save_trajectory,
+    save_views,
+)
+from gaussian_slam.step4_fusion.surface import extract_points
 from gaussian_slam.step4_fusion.tsdf import TSDFVolume
 
 parser = argparse.ArgumentParser()
@@ -78,6 +84,11 @@ parser.add_argument(
     "--depth-weight", type=float, default=1.0, help="depth L1 (m) vs colour L1; 1 = similar pull"
 )
 parser.add_argument("--anchor-weight", type=float, default=100.0)
+parser.add_argument("--lr-rot", type=float, default=0.005, help="camera rotation lr (radians)")
+parser.add_argument("--lr-trans", type=float, default=0.005, help="camera shift lr (metres)")
+parser.add_argument(
+    "--lr-pose-final", type=float, default=0.1, help="camera lrs decay to this share by the end"
+)
 parser.add_argument("--budget-mb", type=float, default=512)
 args = parser.parse_args()
 
@@ -130,6 +141,7 @@ for mode in args.modes:
         model, poses, cams, images, depths, mode=mode, steps=args.steps,
         gauss_block=args.gauss_block, track_iters=args.track_iters, warmup=args.warmup,
         depth_weight=args.depth_weight, anchor_weight=args.anchor_weight, radius=args.voxel,
+        lr_rot=args.lr_rot, lr_trans=args.lr_trans, lr_pose_final=args.lr_pose_final,
         background=black, tile_options=tile_options, truth=truth,
     )  # fmt: skip
     with torch.no_grad():
@@ -142,19 +154,9 @@ for mode in args.modes:
         corrected[mode] = [poses(c, k) for k, c in enumerate(cams)]
     reports[mode] = trajectory_report(corrected[mode], truth)
     models[mode] = model
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "frames": [k * args.every for k in range(len(cams))],
-            "R": torch.stack([c.R for c in corrected[mode]]).cpu(),
-            "t": torch.stack([c.t for c in corrected[mode]]).cpu(),
-            "R_true": torch.stack([c.R for c in truth]).cpu(),
-            "t_true": torch.stack([c.t for c in truth]).cpu(),
-            "R_noisy": torch.stack([c.R for c in cams]).cpu(),
-            "t_noisy": torch.stack([c.t for c in cams]).cpu(),
-            "args": vars(args),
-        },
-        out / f"stage_c_{mode}.pt",
+    frame_ids = [k * args.every for k in range(len(cams))]
+    save_checkpoint(
+        out / f"stage_c_{mode}.pt", model, corrected[mode], truth, cams, frame_ids, vars(args)
     )
 
 # 4. Report.
@@ -201,68 +203,11 @@ plt.savefig(out / "stage_c_curves.png", dpi=120)
 print(f"saved {out / 'stage_c_curves.png'}")
 
 # 5. Pictures for a visual check.
-
-# Before / after: the 3 training frames with the largest starting position error. Each model
-# is drawn from its own cameras: the start from the noisy ones, each mode from its corrected
-# ones. Wrong poses show as blur and doubled edges.
-worst = sorted(range(len(cams)), key=lambda k: -reports["start"]["per_camera_cm"][k])[:3]
-names = list(models)
-fig, axes = plt.subplots(len(worst), len(names) + 1, figsize=(3 * (len(names) + 1), 2 * len(worst)))
-with torch.no_grad():
-    for row, k in enumerate(worst):
-        axes[row, 0].imshow(images[k].clamp(0, 1).cpu().numpy())
-        axes[row, 0].set_ylabel(f"frame {k * args.every}")
-        for col, name in enumerate(names, 1):
-            image = models[name](corrected[name][k], black, **tile_options)[0]
-            axes[row, col].imshow(image.clamp(0, 1).cpu().numpy())
-            axes[row, col].set_xlabel(
-                f"{psnr(image, images[k]):.1f} dB, {reports[name]['per_camera_cm'][k]:.1f} cm"
-            )
-        for col, title in enumerate(["target", *names]):
-            axes[0, col].set_title(title)
-for ax in axes.flat:
-    ax.set_xticks([])
-    ax.set_yticks([])
-fig.suptitle("Training frames with the largest starting pose error (PSNR, camera position error)")
-plt.tight_layout()
-plt.savefig(out / "stage_c_views.png", dpi=120)
-plt.close(fig)
-print(f"saved {out / 'stage_c_views.png'}")
-
-
-def centres(cs):
-    return torch.stack([(-c.R.T @ c.t).cpu() for c in cs])  # camera positions in the world
-
-
-# Trajectory from above: the plane in which the true camera positions spread the most.
-true_c = centres(truth)
-_, _, V = torch.linalg.svd(true_c - true_c.mean(0))
-plane = V[:2].T  # (3, 2): the two directions of largest spread
-true_2d = (true_c - true_c.mean(0)) @ plane
-scale = 20  # errors are a few cm on a path of metres: draw them 20x longer
-fig, axes = plt.subplots(1, len(names), figsize=(4.5 * len(names), 4.5), squeeze=False)
-for ax, name in zip(axes[0], names, strict=True):
-    est_2d = (centres(corrected[name]) - true_c.mean(0)) @ plane
-    tip = true_2d + scale * (est_2d - true_2d)
-    ax.plot(true_2d[:, 0], true_2d[:, 1], "-", color="0.6", lw=1, label="true path")
-    for a, b in zip(true_2d, tip, strict=True):
-        ax.plot([a[0], b[0]], [a[1], b[1]], color="tab:red", lw=1)
-    ax.scatter(true_2d[:, 0], true_2d[:, 1], s=6, color="black", zorder=3)
-    r = reports[name]
-    ax.set_title(f"{name}: RMSE {r['pos_raw_rmse_cm']:.2f} cm, ATE {r['ate_rmse_cm']:.2f} cm")
-    ax.set_aspect("equal")
-    ax.grid(alpha=0.3)
-axes[0, 0].plot([], [], color="tab:red", label=f"position error x{scale}")
-axes[0, 0].legend(loc="best", fontsize=8)
-plt.tight_layout()
-plt.savefig(out / "stage_c_trajectory.png", dpi=120)
-plt.close(fig)
-print(f"saved {out / 'stage_c_trajectory.png'}")
-
-# Blob centres as point clouds: the start was built from the noisy poses, so its walls are
-# thick and doubled; after refinement they should be thinner.
+frame_ids = [k * args.every for k in range(len(cams))]
+save_views(
+    out / "stage_c_views.png", models, corrected, reports, images, frame_ids, black, tile_options
+)
+save_trajectory(out / "stage_c_trajectory.png", corrected, reports, truth)
 for name, m in models.items():
-    means, _, _, rgb, opacity = m.values()
-    keep = opacity > 0.1  # nearly transparent blobs do not show in the images
-    save_ply(out / f"stage_c_gaussians_{name}.ply", means[keep].detach(), rgb[keep].detach())
-print(f"saved stage_c_gaussians_{{{','.join(names)}}}.ply to {out}")
+    save_gaussians(out / f"stage_c_gaussians_{name}.ply", m)
+print(f"saved stage_c_views.png, stage_c_trajectory.png, stage_c_gaussians_*.ply to {out}")
