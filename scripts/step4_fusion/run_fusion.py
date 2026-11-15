@@ -1,8 +1,11 @@
 """Step 4: fuse a Replica scene into a TSDF grid and save its surface as coloured points.
 
-uv run python scripts/step4_fusion/run_fusion.py                        # room0, every 5th frame, 2 cm
+uv run python scripts/step4_fusion/run_fusion.py                        # room0, quick preview
 uv run python scripts/step4_fusion/run_fusion.py --noise random         # same, with wrong poses
 uv run python scripts/step4_fusion/run_fusion.py --noise drift --show   # open a 3D viewer at the end
+
+Defaults are for a quick look: every 15th frame, images shrunk 8x (1200x680 -> 150x85),
+5 cm voxels. For a detailed surface: --every 5 --stride 1 --voxel 0.02.
 
 Outputs in outputs/replica_<scene>/:
   points_<noise>.ply  surface points with colour and normal (Open3D, MeshLab or CloudCompare)
@@ -22,10 +25,10 @@ from gaussian_slam.step4_fusion.tsdf import TSDFVolume
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data", default="data/Replica/room0", help="scene folder")
-parser.add_argument("--every", type=int, default=5, help="use every n-th frame")
+parser.add_argument("--every", type=int, default=15, help="use every n-th frame")
 parser.add_argument("--limit", type=int, default=None, help="stop after this many frames")
-parser.add_argument("--stride", type=int, default=1, help="keep every n-th pixel (2 = half size)")
-parser.add_argument("--voxel", type=float, default=0.02, help="voxel size in metres")
+parser.add_argument("--stride", type=int, default=8, help="keep every n-th pixel (8: 150x85 px)")
+parser.add_argument("--voxel", type=float, default=0.05, help="voxel size in metres")
 parser.add_argument("--trunc", type=float, default=4.0, help="truncation, in voxels")
 parser.add_argument("--depth-max", type=float, default=10.0, help="ignore depth beyond (m)")
 parser.add_argument("--min-weight", type=float, default=3.0, help="voxels seen by more frames")
